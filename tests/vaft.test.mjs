@@ -17,7 +17,9 @@ const instrumented = source.slice(0, start) + `
         setTokenResolver(fn) { getAccessToken = fn; },
         setPlaylistProcessor(fn) { processStreamPlaylist = fn; },
         setStorageHookFailed(value) { localStorageHookFailed = value; },
-        isStripping() { return isActivelyStrippingAds; }
+        isStripping() { return isActivelyStrippingAds; },
+        isActiveChannel,
+        currentPlayer() { return getPlayerAndState()?.player; }
     };
 })();`;
 
@@ -249,13 +251,17 @@ test('the page-side token bridge aborts stalled requests', async () => {
     assert.equal(response.error, 'aborted');
 });
 
-test('playlist processing failures reject instead of leaving fetch pending', async () => {
+test('playlist processing failures fall back to a stripped playlist instead of failing the player', async () => {
     const h = harness();
     addStream(h.context);
-    h.context.fetch = async () => new Response(clean(100));
+    h.context.fetch = async () => new Response(ads);
     h.api.setPlaylistProcessor(async () => { throw new Error('parse failed'); });
     h.api.hookWorkerFetch();
-    await assert.rejects(h.context.fetch(mainUrl), /parse failed/);
+    const response = await h.context.fetch(mainUrl);
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /#EXTM3U/);
+    assert.ok(h.context.AdSegmentCache.has('https://cdn.test/ad.ts'));
+    assert.ok(h.messages.some(m => m.event === 'playlist-processing-failed'));
 });
 
 test('a response started before a restart cannot mutate the replacement stream', async () => {
@@ -450,4 +456,48 @@ test('diagnostics are bounded and contain no request credentials', () => {
     const diagnostics = h.context.vaftDiagnostics();
     assert.equal(diagnostics.length, 100);
     assert.doesNotMatch(JSON.stringify(diagnostics), /Authorization|Client-Integrity|https:\/\//);
+});
+
+test('a second ad-finished reload inside the cooldown becomes a pause/play', async () => {
+    const h = harness();
+    const r = recovery(h, () => player(true));
+    assert.equal(await h.api.doTwitchPlayerTask(false, true, 'ad-finished'), true);
+    assert.equal(r.reloads, 1);
+    const current = h.api.currentPlayer();
+    const before = current.playCalls;
+    assert.equal(await h.api.doTwitchPlayerTask(false, true, 'ad-finished'), false);
+    assert.equal(r.reloads, 1);
+    assert.equal(current.playCalls, before + 1);
+    assert.ok(h.context.vaftDiagnostics().some(m => m.event === 'reload-suppressed'));
+});
+
+test('automatic reloads are capped per window but manual resync is not', async () => {
+    const h = harness();
+    h.context.AdFinishedReloadCooldown = 0;
+    const r = recovery(h, () => player(true));
+    for (let i = 0; i < 5; i++) await h.api.doTwitchPlayerTask(false, true, 'buffering');
+    assert.equal(r.reloads, h.context.AutoReloadLimit);
+    assert.equal(await h.api.doTwitchPlayerTask(false, true, 'manual-resync'), true);
+    assert.equal(r.reloads, h.context.AutoReloadLimit + 1);
+});
+
+test('recovery does not reload again while the new player is stripping a preroll', async () => {
+    const h = harness();
+    const r = recovery(h, () => {
+        setTimeout(() => h.api.updateAdblockBanner({ hasAds: true, isStrippingAdSegments: true }), 1);
+        return player(true);
+    });
+    // The stripping replacement never advances; previously this caused a second reload.
+    h.api.setPlayerResolver((() => { const p = player(true); p.play = () => Promise.resolve(); return () => ({ player: r.reloads ? p : r.old, state: r.state }); })());
+    assert.equal(await h.api.doTwitchPlayerTask(false, true, 'ad-finished'), false);
+    assert.equal(r.reloads, 1);
+    assert.ok(h.context.vaftDiagnostics().some(m => m.event === 'recovery-waiting-for-ad'));
+});
+
+test('worker messages are accepted on popout and moderator pages for the same channel', () => {
+    const h = harness();
+    for (const [path, ok] of [['/example', true], ['/popout/example/player', true], ['/moderator/Example', true], ['/popout/other/player', false], ['/', true]]) {
+        h.context.location.pathname = path;
+        assert.equal(h.api.isActiveChannel('example'), ok, path);
+    }
 });

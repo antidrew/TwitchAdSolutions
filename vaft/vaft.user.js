@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TwitchAdSolutions (vaft)
 // @namespace    https://github.com/antidrew/TwitchAdSolutions
-// @version      38.0.0
+// @version      38.1.0
 // @description  Multiple solutions for blocking Twitch ads (vaft)
 // @updateURL    https://raw.githubusercontent.com/antidrew/TwitchAdSolutions/vaft-playback-recovery/vaft/vaft.user.js
 // @downloadURL  https://raw.githubusercontent.com/antidrew/TwitchAdSolutions/vaft-playback-recovery/vaft/vaft.user.js
@@ -43,6 +43,9 @@
         scope.ShowResyncButton = true;
         scope.PlayerRecoveryTimeout = 6000;
         scope.PlayerRecoveryPollInterval = 150;
+        scope.AdFinishedReloadCooldown = 30000;// A reload often triggers a fresh preroll; don't reload again for its end within this window (pause/play instead)
+        scope.AutoReloadLimit = 3;// Maximum automatic player reloads within AutoReloadWindow (manual Resync is never limited)
+        scope.AutoReloadWindow = 120000;
         scope.HasTriggeredPlayerReload = false;
         scope.StreamInfos = [];
         scope.StreamInfosByUrl = [];
@@ -66,8 +69,10 @@
         scope.AllSegmentsAreAdSegments = false;
     }
     let isActivelyStrippingAds = false;
+    let strippingUpdatedAt = 0;
     let localStorageHookFailed = false;
     let playerRecovery = null;
+    const autoReloadHistory = [];// { time, reason } of automatic reloads, used to break reload loops
     const playbackDiagnostics = [];
     function recordPlaybackEvent(event, details = {}) {
         playbackDiagnostics.push({ time: Date.now(), event, ...details });
@@ -234,7 +239,7 @@
                 twitchWorkers.push(this);
                 this.addEventListener('message', (e) => {
                     // A terminated channel's worker may still finish an outstanding request.
-                    if (e.data.channelName && e.data.channelName.toLowerCase() !== window.location.pathname.split('/')[1]?.toLowerCase()) {
+                    if (e.data.channelName && !isActiveChannel(e.data.channelName)) {
                         return;
                     }
                     if (e.data.key == 'UpdateAdBlockBanner') {
@@ -258,6 +263,13 @@
                     }
                 });
             }
+            terminate() {
+                const index = twitchWorkers.indexOf(this);
+                if (index >= 0) {
+                    twitchWorkers.splice(index, 1);
+                }
+                return super.terminate();
+            }
         };
         let workerInstance = reinsertWorkers(newWorker, reinsert);
         Object.defineProperty(window, 'Worker', {
@@ -272,6 +284,27 @@
                 }
             }
         });
+    }
+    function getActiveChannelName() {
+        // Prefer the channel the player is actually playing (covers popout, moderator view and front-page players).
+        try {
+            const path = playerForMonitoringBuffering?.player?.core?.state?.path;
+            if (path) {
+                const fileName = new URL(path).pathname.split('/').pop();
+                if (fileName?.endsWith('.m3u8')) {
+                    return fileName.slice(0, -5).toLowerCase();
+                }
+            }
+        } catch {}
+        const parts = window.location.pathname.split('/').filter(Boolean).map(x => x.toLowerCase());
+        if (['popout', 'moderator', 'embed'].includes(parts[0])) {
+            return parts[1] || null;
+        }
+        return parts[0] || null;
+    }
+    function isActiveChannel(channelName) {
+        const active = getActiveChannelName();
+        return !active || active === channelName.toLowerCase();
     }
     function getWasmWorkerJs(twitchBlobUrl) {
         const req = new XMLHttpRequest();
@@ -304,7 +337,23 @@
                     return new Promise(function(resolve, reject) {
                         const processAfter = async function(response) {
                             if (response.status === 200) {
-                                resolve(new Response(await processM3U8(url, await response.text(), realFetch, requestId, streamInfo)));
+                                const text = await response.text();
+                                let result;
+                                try {
+                                    result = await processM3U8(url, text, realFetch, requestId, streamInfo);
+                                } catch (err) {
+                                    // A failed playlist makes Twitch's player error out and reload, which can loop.
+                                    // Serve the playlist with ad segments removed instead.
+                                    if (streamInfo) {
+                                        postStreamMessage(streamInfo, { key: 'PlaybackDiagnostic', event: 'playlist-processing-failed', details: { message: String(err?.message || err) } });
+                                    }
+                                    try {
+                                        result = streamInfo ? stripAdSegments(text, false, streamInfo) : text;
+                                    } catch {
+                                        result = text;
+                                    }
+                                }
+                                resolve(new Response(result));
                             } else {
                                 resolve(response);
                             }
@@ -335,7 +384,7 @@
                                 let streamInfo = StreamInfos[channelName];
                                 if (streamInfo != null && streamInfo.EncodingsM3U8 != null) {
                                     const cachedUrl = streamInfo.EncodingsM3U8.match(/^https:.*\.m3u8$/m)?.[0];
-                                    if (!cachedUrl || (await realFetch(cachedUrl)).status !== 200) {
+                                    if (!cachedUrl || !(await fetchPlaylist(cachedUrl, realFetch, BackupRequestTimeout).catch(() => null))) {
                                         // The cached encodings are dead (the stream probably restarted).
                                         streamInfo = null;
                                     }
@@ -893,6 +942,7 @@
     }
     function updateAdblockBanner(data) {
         isActivelyStrippingAds = !!data.isStrippingAdSegments;
+        strippingUpdatedAt = Date.now();
         const playerRootDiv = document.querySelector('.video-player');
         if (playerRootDiv != null) {
             let adBlockDiv = null;
@@ -1002,6 +1052,27 @@
                 return Promise.resolve(false);
             }
         }
+        if (isReload && reason !== 'manual-resync') {
+            const now = Date.now();
+            while (autoReloadHistory.length && autoReloadHistory[0].time < now - AutoReloadWindow) {
+                autoReloadHistory.shift();
+            }
+            const previous = autoReloadHistory[autoReloadHistory.length - 1];
+            // reload -> new preroll -> ad ends -> reload ... is the classic loop. Break it.
+            const isRepeatAdReload = reason === 'ad-finished' && previous?.reason === 'ad-finished' && previous.time > now - AdFinishedReloadCooldown;
+            if (isRepeatAdReload || autoReloadHistory.length >= AutoReloadLimit) {
+                recordPlaybackEvent('reload-suppressed', { reason, recentReloads: autoReloadHistory.length });
+                if (reason === 'ad-finished' || reason === 'buffering') {
+                    // A pause/play still nudges the player back to the clean stream without a new access token.
+                    try {
+                        player.pause();
+                        return Promise.resolve(player.play()).then(() => false, () => false);
+                    } catch {}
+                }
+                return Promise.resolve(false);
+            }
+            autoReloadHistory.push({ time: now, reason });
+        }
         if (isReload) {
             const request = { reason, path: window.location.pathname, cancelled: false, promise: null };
             playerRecovery = request;
@@ -1066,15 +1137,23 @@
                 const oldCore = oldPlayer.core;
                 const oldVideo = oldPlayer.getHTMLVideoElement?.();
                 recordPlaybackEvent('recovery-started', { reason: request.reason, attempt });
+                const reloadStartedAt = Date.now();
                 current.state.setSrc({ isNewMediaPlayerInstance: true, refreshAccessToken: true });
                 postTwitchWorkerMessage('TriggeredPlayerReload');
                 const deadline = Date.now() + PlayerRecoveryTimeout;
+                let isStrippingPreroll = false;
                 let resumedPlayer = null;
                 let observedVideo = null;
                 let lastTime = null;
                 while (Date.now() < deadline && isCurrent()) {
                     await sleep();
                     if (!isCurrent()) {
+                        break;
+                    }
+                    if (isActivelyStrippingAds && strippingUpdatedAt >= reloadStartedAt) {
+                        // The new player got an ad with no clean backup, so nothing plays until it ends.
+                        // Another reload would only fetch another ad; the end of this one is handled normally.
+                        isStrippingPreroll = true;
                         break;
                     }
                     const replacement = getPlayerAndState();
@@ -1098,6 +1177,10 @@
                         recordPlaybackEvent('recovery-playing', { reason: request.reason, attempt });
                         return true;
                     }
+                }
+                if (isStrippingPreroll) {
+                    recordPlaybackEvent('recovery-waiting-for-ad', { reason: request.reason, attempt });
+                    return false;
                 }
                 recordPlaybackEvent(isCurrent() ? 'recovery-timeout' : 'recovery-cancelled', { reason: request.reason, attempt });
             }
